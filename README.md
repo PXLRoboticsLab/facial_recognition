@@ -1,5 +1,5 @@
 # ROS - Facial recognition
-This repo contains all the code for the customer pipeline. This includes a dashboard to add a new customer, a script to do all the SVM retraining and a script to automaticly learn new customers.
+This project is for easy face recognition on ROS camera streams.
 
 ## Getting started
 
