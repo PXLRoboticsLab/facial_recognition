@@ -1,24 +1,25 @@
 #!/usr/bin/env python
 import argparse
 import rospy
-import math
 import cv2
 import pickle
-import numpy as np
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge, CvBridgeError
-from scipy import misc
-import align.detect_face
-import tensorflow as tf
 import facenet
 import time
+import datetime
+import threading
+import itertools
 import glob
-import schedule
 import os
+import align.detect_face
+import numpy as np
+import tensorflow as tf
 from facial_recognition.msg import personData
 from facial_recognition.msg import personDataArray
 from std_msgs.msg import String
 from rostopic import ROSTopicHz
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge, CvBridgeError
+from scipy import misc
 
 changed = []
 
@@ -49,15 +50,10 @@ def change_oldest_picture(folder, person, new_picture):
         print(oldest_file)
 
 
-def reset_list():
-    global changed
-    changed = []
-
-
 def create_network_face_detection(gpu_memory_fraction):
     with tf.Graph().as_default():
         gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=(gpu_memory_fraction / 2))
-        #gpu_options = tf.GPUOptions(allow_growth=True)
+        # gpu_options = tf.GPUOptions(allow_growth=True)
         sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options, log_device_placement=False))
         with sess.as_default():
             pnet, rnet, onet = align.detect_face.create_mtcnn(sess, None)
@@ -87,7 +83,7 @@ def align_data(image_list, image_size, margin, pnet, rnet, onet):
                     bb[3] = np.minimum(det[3] + margin / 2, img_size[0])
                     cropped = image_list[x][bb[1]:bb[3], bb[0]:bb[2], :]
                     # Check if found face isn't to blurry
-                    if cv2.Laplacian(cropped, cv2.CV_64F).var() > 100:
+                    if cv2.Laplacian(cropped, cv2.CV_64FC3).var() > 100:
                         aligned = misc.imresize(cropped, (image_size, image_size), interp='bilinear')
                         prewhitened = facenet.prewhiten(aligned)
                         img_list.append(prewhitened)
@@ -117,9 +113,8 @@ class PersonClassifier():
     _model_pkl = None
     _class_names = None
 
-    def __init__(self, model, classifier_filename, data_dir, camera_topic, id, memory, pnet, rnet, onet):
+    def __init__(self, model, classifier_location, data_dir, camera_topic, id, memory, pnet, rnet, onet):
         self._model = model
-        self._classifier = classifier_filename
         self._data_dir = data_dir
         self._camera_topic = camera_topic
         self._id = id
@@ -127,7 +122,15 @@ class PersonClassifier():
         self._rnet = rnet
         self._onet = onet
 
-        self.gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=(memory/2))
+        self.changed = []
+
+        self.classifiers = self.load_classifiers(classifier_location)
+        self.classifier_dir = classifier_location
+        self.predictions = []
+        self.person_embs = np.load(os.path.join(classifier_location, 'embeddings.npy'))
+        self.scheduler()
+
+        self.gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=(memory / 2))
 
         self._hz = int((get_hz(self._camera_topic) / 5) - 0.5)
 
@@ -136,42 +139,90 @@ class PersonClassifier():
         self.pub_image = rospy.Publisher("focus_vision/image/identification/" + self._id, Image, queue_size=30)
         self.pub_unknown_person = rospy.Publisher("focus_vision/image/unidentified", Image, queue_size=30)
 
-        with tf.gfile.FastGFile(self._model, 'rb') as f:
-            graph_def = tf.GraphDef()
-            graph_def.ParseFromString(f.read())
-            _ = tf.import_graph_def(graph_def, name='')
+        with tf.Graph().as_default():
+            with tf.Session(
+                    config=tf.ConfigProto(gpu_options=self.gpu_options, log_device_placement=False)) as self.sess:
+                facenet.load_model(self._model)
+                # Retrieve the required input and output tensors for classification from the model
+                self.images_placeholder = self.sess.graph.get_tensor_by_name("input:0")
+                self.embeddings = self.sess.graph.get_tensor_by_name("embeddings:0")
+                self.phase_train_placeholder = self.sess.graph.get_tensor_by_name("phase_train:0")
+                self.embedding_size = self.embeddings.get_shape()[1]
 
-        with tf.Session(config=tf.ConfigProto(gpu_options=self.gpu_options, log_device_placement=False)) as self.sess:
-            # Retrieve the required input and output tensors for classification from the model
-            self.images_placeholder = self.sess.graph.get_tensor_by_name("input:0")
-            self.embeddings = self.sess.graph.get_tensor_by_name("embeddings:0")
-            self.phase_train_placeholder = self.sess.graph.get_tensor_by_name("phase_train:0")
-            self.embedding_size = self.embeddings.get_shape()[1]
+                self.bridge = CvBridge()
 
-            self.bridge = CvBridge()
+                # Subscribe to the camera topic provided in the args
+                self.image_sub = rospy.Subscriber(self._camera_topic, Image, self.classify)
 
-            print('Loaded classifier model from file "%s"' % self._classifier)
-            with open(self._classifier, 'rb') as infile:
-                (self._model_pkl, self._class_names) = pickle.load(infile)
+                # Subscribe to the topic providing the latest SVM classifier
+                self.model_sub = rospy.Subscriber("/trained_model", String, self.reload_model)
 
-            # Subscribe to the camera topic provided in the args
-            self.image_sub = rospy.Subscriber(self._camera_topic, Image, self.classify)
+                rospy.spin()
 
-            # Subscribe to the topic providing the latest SVM classifier
-            self.model_sub = rospy.Subscriber("/trained_model", String, self.reload_model)
+    def scheduler(self):
+        thread_embeddings = threading.Thread(target=self.write_embeddings)
+        thread_embeddings.daemon = True
+        thread_embeddings.start()
+
+        thread_reset = threading.Thread(target=self.reset_list)
+        thread_reset.daemon = True
+        thread_reset.start()
+
+    def write_embeddings(self):
+        while True:
+            time.sleep(600)
+            np.save(os.path.join(self.classifier_dir, 'embeddings.npy'), self.person_embs)
+
+    def reset_list(self):
+        while True:
+            time.sleep(59)
+            now = datetime.datetime.now().time()
+            if datetime.time(now.hour, now.minute) == datetime.time(11,59) \
+                    or datetime.time(now.hour, now.minute) == datetime.time(23,59):
+                self.changed = []
+
+
+
+    def publish_unknown(self, img):
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img = cv2.resize(img, (160, 160))
+        self.pub_unknown_person.publish(self.bridge.cv2_to_imgmsg(img, 'bgr8'))
+
+    def load_classifiers(self, folder):
+        classifiers = {}
+        for cls in os.listdir(folder):
+            if '.pkl' in cls:
+                with open(os.path.join(folder, cls), 'rb') as infile:
+                    (model_pkl, class_names) = pickle.load(infile)
+                    classifiers.update({class_names[0]: {'model': model_pkl, 'class_names': class_names}})
+        return classifiers
 
     def reload_model(self, data):
-        self._classifier = data.data
-        with open(self._classifier, 'rb') as infile:
-            (self._model_pkl, self._class_names) = pickle.load(infile)
+        with open(data.data, 'rb') as infile:
+            (model_pkl, class_names) = pickle.load(infile)
+            self.classifiers[class_names[0]]['model'] = model_pkl
+            self.classifiers[class_names[0]]['class_names'] = class_names
+            self.person_embs = np.load(os.path.join(self.classifier_dir, 'embeddings.npy'))
+
+    def predict(self, name, index, embedding):
+        model = self.classifiers[name]['model']
+        class_names = self.classifiers[name]['class_names']
+        prediction = model.predict_proba([embedding])
+        best_class_indices = np.argmax(prediction, axis=1)
+        best_class_probabilities = prediction[np.arange(len(best_class_indices)), best_class_indices]
+        for i in range(len(best_class_indices)):
+            self.predictions.append({'index': index,
+                                     'name': class_names[best_class_indices[i]],
+                                     'confidence': best_class_probabilities[i]})
 
     def classify(self, data):
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+            cv_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
         except CvBridgeError as e:
-            print(e)
-
+            return
+# if self._counter == self._hz:
         if self._counter == self._hz:
+            start = time.time()
             self._counter = 0
 
             # Resize the image to a standard width and height
@@ -180,48 +231,75 @@ class PersonClassifier():
             cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
 
             # Align the faces in the list properly before classification
+
             images, boxes = align_data([cv_image], self.IMAGE_SIZE, self.MARGIN, self._pnet, self._rnet, self._onet)
+
             # Check if after aligning the list was returned and is not None
             if images is not None:
-                # Prepare for classification of images
-                nrof_images = len(images)
-                nrof_batches_per_epoch = int(math.ceil(1.0 * nrof_images / self.BATCH_SIZE))
-                emb_array = np.zeros((nrof_images, self.embedding_size))
-                for i in range(nrof_batches_per_epoch):
-                    start_index = i * self.BATCH_SIZE
-                    end_index = min((i + 1) * self.BATCH_SIZE, nrof_images)
-                    feed_dict = {self.images_placeholder: images, self.phase_train_placeholder: False}
-                    emb_array[start_index:end_index, :] = self.sess.run(self.embeddings, feed_dict=feed_dict)
+                feed_dict = {self.images_placeholder: images, self.phase_train_placeholder: False}
+                emb_array = self.sess.run(self.embeddings, feed_dict=feed_dict)
 
-                predictions = self._model_pkl.predict_proba(emb_array)
-                best_class_indices = np.argmax(predictions, axis=1)
-                best_class_probabilities = predictions[np.arange(len(best_class_indices)), best_class_indices]
+                lowest_dist = 2
+                lowest_index = 0
+                lowest_name = None
+
+                names = {}
+                for person in self.person_embs.item():
+                    for i in range(len(emb_array)):
+                        dist = np.sqrt(
+                            np.sum(np.square(np.subtract(emb_array[i], self.person_embs.item().get(person)))))
+                        if dist < 1 and person != 'Unknown':
+                            names.update({person: i})
+                        elif dist < lowest_dist:
+                            lowest_index = i
+                            lowest_name = person
+
+                if len(names) > 0:
+                    threads = []
+                    self.predictions = []
+                    for index, name in enumerate(names):
+                        threads.append(threading.Thread(target=self.predict,
+                                                        args=(name, names.get(name), emb_array[names.get(name)],)))
+                        threads[index].start()
+                        threads[index].join(0.15)
+                else:
+                    self.predictions = []
+                    self.predict(lowest_name, lowest_index, emb_array[lowest_index])
+
+                getIndex, getConfidence = lambda a: a['index'], lambda a: a['confidence']  # or use operator.itemgetter
+                groups = itertools.groupby(sorted(self.predictions, key=getIndex), key=getIndex)
+                m = [max(b, key=getConfidence) for a, b in groups]
+                predictionsCopy = [l for l in self.predictions if l in m]
 
                 msgs = personDataArray()
+                found = False
+                for i in range(len(boxes)):
+                    for prediction in predictionsCopy:
+                        predict_index = prediction['index']
+                        if i == predict_index:
+                            found = True
+                            self.person_embs.item()[prediction['name']] = emb_array[i]
+                            msg = personData(prediction['name'].encode('ascii', 'ignore'), prediction['confidence'])
+                            cv_image = cv2.rectangle(cv_image, (int(boxes[i][0]), int(boxes[i][1])),
+                                                     (int(boxes[i][2]), int(boxes[i][3])), (0, 255, 0), 2)
+                            cv_image = cv2.putText(cv_image, prediction['name'],
+                                                   (int(boxes[i][0]), int(boxes[i][1] - 10)),
+                                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                                   (0, 255, 0), 1, cv2.LINE_AA)
 
-                for i in range(len(best_class_indices)):
-                    print(
-                        '%4d  %s: %.3f' % (
-                            i, self._class_names[best_class_indices[i]], best_class_probabilities[i]))
-                    msg = personData(self._class_names[best_class_indices[i]], self._id,
-                                     best_class_probabilities[i])
-                    if best_class_probabilities[i] > 0.6:
+                    if not found:
+                        msg = personData('Unknown', 1)
                         cv_image = cv2.rectangle(cv_image, (int(boxes[i][0]), int(boxes[i][1])),
                                                  (int(boxes[i][2]), int(boxes[i][3])), (0, 255, 0), 2)
-                        cv_image = cv2.putText(cv_image, self._class_names[best_class_indices[i]],
+                        cv_image = cv2.putText(cv_image, 'Unknown',
                                                (int(boxes[i][0]), int(boxes[i][1] - 10)),
                                                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                                                (0, 255, 0), 1, cv2.LINE_AA)
-                        if best_class_probabilities[i] > 0.8:
-                            change_oldest_picture(self._data_dir, self._class_names[best_class_indices[i]], images[i])
-                    if self._class_names[best_class_indices[i]] == "Unknown":
-                        misc.imsave('/home/maarten/Pictures/tmp.png', images[i])
-                        img = cv2.imread('/home/maarten/Pictures/tmp.png')
-                        self.pub_unknown_person.publish(self.bridge.cv2_to_imgmsg(img, 'bgr8'))
-
                     msgs.data.append(msg)
                 self.pub.publish(msgs)
+            cv_image = cv2.cvtColor(cv_image, cv2.COLOR_RGB2BGR)
             self.pub_image.publish(self.bridge.cv2_to_imgmsg(cv_image, 'bgr8'))
+            print('Time to analyze frame: {} ms'.format((time.time() - start)*1000))
         else:
             self._counter += 1
 
@@ -233,7 +311,7 @@ if __name__ == "__main__":
     parser.add_argument('model', type=str,
                         help='Path to a model protobuf (.pb) file')
     parser.add_argument('classifier',
-                        help='Path to the classifier model file name as a pickle (.pkl) file.')
+                        help='Path to the classifier (.pkl) files.')
     parser.add_argument('data_dir', type=str,
                         help='Path to the data directory containing classifier data.')
     parser.add_argument('camera_topic', type=str,
@@ -241,18 +319,10 @@ if __name__ == "__main__":
     parser.add_argument('--id', type=str, help='The id of the camera being analized.', default='dlink_1')
     parser.add_argument('--gpu_memory_fraction', type=float,
                         help='Upper bound on the amount of GPU memory that will be used by the process.', default=0.40)
-    # parser.add_argument('--location', type=float, nargs='2',
-    # help='The X and Y location of the camera, use this option only for stationary cameras.')
 
     args = parser.parse_args()
-
-    schedule.every().day.at("11:59").do(reset_list)
-    schedule.every().day.at("23:59").do(reset_list)
 
     pnet, rnet, onet = create_network_face_detection(args.gpu_memory_fraction)
 
     classifier = PersonClassifier(args.model, args.classifier, args.data_dir, args.camera_topic, args.id,
                                   args.gpu_memory_fraction, pnet, rnet, onet)
-    while True:
-        schedule.run_pending()
-        time.sleep(5)
