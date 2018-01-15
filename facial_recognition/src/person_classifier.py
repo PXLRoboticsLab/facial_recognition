@@ -181,8 +181,6 @@ class PersonClassifier():
                     or datetime.time(now.hour, now.minute) == datetime.time(23,59):
                 self.changed = []
 
-
-
     def publish_unknown(self, img):
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         img = cv2.resize(img, (160, 160))
@@ -198,10 +196,14 @@ class PersonClassifier():
         return classifiers
 
     def reload_model(self, data):
+        print(data.data)
         with open(data.data, 'rb') as infile:
             (model_pkl, class_names) = pickle.load(infile)
-            self.classifiers[class_names[0]]['model'] = model_pkl
-            self.classifiers[class_names[0]]['class_names'] = class_names
+            if class_names[0] in self.classifiers:
+                self.classifiers[class_names[0]]['model'] = model_pkl
+                self.classifiers[class_names[0]]['class_names'] = class_names
+            else:
+                self.classifiers.update({class_names[0]: {'model': model_pkl, 'class_names': class_names}})
             self.person_embs = np.load(os.path.join(self.classifier_dir, 'embeddings.npy'))
 
     def predict(self, name, index, embedding):
@@ -278,14 +280,23 @@ class PersonClassifier():
                         predict_index = prediction['index']
                         if i == predict_index:
                             found = True
-                            self.person_embs.item()[prediction['name']] = emb_array[i]
-                            msg = personData(prediction['name'].encode('ascii', 'ignore'), prediction['confidence'])
-                            cv_image = cv2.rectangle(cv_image, (int(boxes[i][0]), int(boxes[i][1])),
-                                                     (int(boxes[i][2]), int(boxes[i][3])), (0, 255, 0), 2)
-                            cv_image = cv2.putText(cv_image, prediction['name'],
-                                                   (int(boxes[i][0]), int(boxes[i][1] - 10)),
-                                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                                   (0, 255, 0), 1, cv2.LINE_AA)
+                            if prediction['confidence'] > 0.8 and prediction['name'] != 'Unknown':
+                                self.person_embs.item()[prediction['name']] = emb_array[i]
+                                msg = personData(prediction['name'].encode('ascii', 'ignore'), prediction['confidence'])
+                                cv_image = cv2.rectangle(cv_image, (int(boxes[i][0]), int(boxes[i][1])),
+                                                         (int(boxes[i][2]), int(boxes[i][3])), (0, 255, 0), 2)
+                                cv_image = cv2.putText(cv_image, prediction['name'],
+                                                       (int(boxes[i][0]), int(boxes[i][1] - 10)),
+                                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                                       (0, 255, 0), 1, cv2.LINE_AA)
+                            else:
+                                msg = personData('Unknown', prediction['confidence'])
+                                cv_image = cv2.rectangle(cv_image, (int(boxes[i][0]), int(boxes[i][1])),
+                                                         (int(boxes[i][2]), int(boxes[i][3])), (0, 255, 0), 2)
+                                cv_image = cv2.putText(cv_image, 'Unknown',
+                                                       (int(boxes[i][0]), int(boxes[i][1] - 10)),
+                                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                                       (0, 255, 0), 1, cv2.LINE_AA)
 
                     if not found:
                         msg = personData('Unknown', 1)
