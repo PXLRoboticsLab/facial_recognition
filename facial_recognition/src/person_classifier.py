@@ -177,13 +177,14 @@ class PersonClassifier():
         while True:
             time.sleep(59)
             now = datetime.datetime.now().time()
-            if datetime.time(now.hour, now.minute) == datetime.time(11,59) \
-                    or datetime.time(now.hour, now.minute) == datetime.time(23,59):
+            if datetime.time(now.hour, now.minute) == datetime.time(11, 59) \
+                    or datetime.time(now.hour, now.minute) == datetime.time(23, 59):
                 self.changed = []
 
     def publish_unknown(self, img):
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         img = cv2.resize(img, (160, 160))
+        img = cv2.fastNlMeansDenoisingColored(img,None,10,10,7,21)
         self.pub_unknown_person.publish(self.bridge.cv2_to_imgmsg(img, 'bgr8'))
 
     def load_classifiers(self, folder):
@@ -222,7 +223,7 @@ class PersonClassifier():
             cv_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
         except CvBridgeError as e:
             return
-# if self._counter == self._hz:
+        # if self._counter == self._hz:
         if self._counter == self._hz:
             start = time.time()
             self._counter = 0
@@ -241,42 +242,34 @@ class PersonClassifier():
                 feed_dict = {self.images_placeholder: images, self.phase_train_placeholder: False}
                 emb_array = self.sess.run(self.embeddings, feed_dict=feed_dict)
 
-                lowest_dist = 2
-                lowest_index = 0
-                lowest_name = None
-
-                names = {}
+                names = []
                 for person in self.person_embs.item():
                     for i in range(len(emb_array)):
                         dist = np.sqrt(
                             np.sum(np.square(np.subtract(emb_array[i], self.person_embs.item().get(person)))))
-                        if dist < 1 and person != 'Unknown':
-                            names.update({person: i})
-                        elif dist < lowest_dist:
-                            lowest_index = i
-                            lowest_name = person
+                        if dist < 1.1 and person != 'Unknown':
+                            poss = {'name': person, 'index': i, 'dist': dist}
+                            names.append(poss)
+
+                getIndex, getDist = lambda a: a['index'], lambda a: a['dist']  # or use operator.itemgetter
+                groups = itertools.groupby(sorted(names, key=getIndex), key=getIndex)
+                m = [min(b, key=getDist) for a, b in groups]
+                namesCleaned = [l for l in names if l in m]
 
                 if len(names) > 0:
                     threads = []
                     self.predictions = []
-                    for index, name in enumerate(names):
+                    for i in range(len(namesCleaned)):
+                        name = namesCleaned[i]
                         threads.append(threading.Thread(target=self.predict,
-                                                        args=(name, names.get(name), emb_array[names.get(name)],)))
-                        threads[index].start()
-                        threads[index].join(0.15)
-                else:
-                    self.predictions = []
-                    self.predict(lowest_name, lowest_index, emb_array[lowest_index])
-
-                getIndex, getConfidence = lambda a: a['index'], lambda a: a['confidence']  # or use operator.itemgetter
-                groups = itertools.groupby(sorted(self.predictions, key=getIndex), key=getIndex)
-                m = [max(b, key=getConfidence) for a, b in groups]
-                predictionsCopy = [l for l in self.predictions if l in m]
+                                                        args=(name['name'], name['index'], emb_array[name['index']],)))
+                        threads[i].start()
+                        threads[i].join(0.15)
 
                 msgs = personDataArray()
                 found = False
                 for i in range(len(boxes)):
-                    for prediction in predictionsCopy:
+                    for prediction in self.predictions:
                         predict_index = prediction['index']
                         if i == predict_index:
                             found = True
@@ -290,6 +283,9 @@ class PersonClassifier():
                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                                                        (0, 255, 0), 1, cv2.LINE_AA)
                             else:
+                                """img = cv_image[int(boxes[i][1]):int(boxes[i][1] + (boxes[i][3] - boxes[i][1])),
+                                      int(boxes[i][0]):int(boxes[i][0] + (boxes[i][2] - boxes[i][0]))]
+                                self.publish_unknown(img)"""
                                 msg = personData('Unknown', prediction['confidence'])
                                 cv_image = cv2.rectangle(cv_image, (int(boxes[i][0]), int(boxes[i][1])),
                                                          (int(boxes[i][2]), int(boxes[i][3])), (0, 255, 0), 2)
@@ -299,6 +295,9 @@ class PersonClassifier():
                                                        (0, 255, 0), 1, cv2.LINE_AA)
 
                     if not found:
+                        """img = cv_image[int(boxes[i][1]):int(boxes[i][1] + (boxes[i][3] - boxes[i][1])),
+                              int(boxes[i][0]):int(boxes[i][0] + (boxes[i][2] - boxes[i][0]))]
+                        self.publish_unknown(img)"""
                         msg = personData('Unknown', 1)
                         cv_image = cv2.rectangle(cv_image, (int(boxes[i][0]), int(boxes[i][1])),
                                                  (int(boxes[i][2]), int(boxes[i][3])), (0, 255, 0), 2)
@@ -306,6 +305,7 @@ class PersonClassifier():
                                                (int(boxes[i][0]), int(boxes[i][1] - 10)),
                                                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                                                (0, 255, 0), 1, cv2.LINE_AA)
+
                     msgs.data.append(msg)
                 self.pub.publish(msgs)
             cv_image = cv2.cvtColor(cv_image, cv2.COLOR_RGB2BGR)
