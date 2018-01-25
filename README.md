@@ -9,7 +9,7 @@ This project requires you to install following dependecies to work.
 * [Facenet](https://github.com/davidsandberg/facenet) 
 * CUDA and cuDNN
 * Tensorflow-gpu 1.0
-* OpenCV 3
+* [OpenCV 3](https://docs.opencv.org/trunk/d2/de6/tutorial_py_setup_in_ubuntu.html)
 * ROS (Indigo or newer)
 
 ### Installation
