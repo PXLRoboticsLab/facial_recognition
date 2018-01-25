@@ -18,7 +18,7 @@ Follow the steps below to install and run this project on your local machine.
 * Clone this repository `$ git clone https://github.com/PXL-IT/facial_recognition.git`
 * Give all the scripts run permission `$ sudo chmod u+x script_name.py`
 * Start a roscore `$ roscore`
-* Run the facial recognition `$ rosrun /path/to/model.pb /path/to/models/dir/ /path/to/aligend/data/ /ros/image/topic` optional arguments:
+* Run the facial recognition `$ rosrun person_classifier.py /path/to/model.pb /path/to/models/dir/ /path/to/aligend/data/ /ros/image/topic` optional arguments:
     * `--id` - **String** - The id of the camera in case you have multiple cameras.
     * `--gpu_memory_fraction` - **float** - Upper bound on the amount of GPU memory that will be used by the process.
 

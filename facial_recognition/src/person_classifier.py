@@ -127,7 +127,10 @@ class PersonClassifier():
         self.classifiers = self.load_classifiers(classifier_location)
         self.classifier_dir = classifier_location
         self.predictions = []
-        self.person_embs = np.load(os.path.join(classifier_location, 'embeddings.npy'))
+        try:
+            self.person_embs = np.load(os.path.join(classifier_location, 'embeddings.npy'))
+        except IOError:
+            self.person_embs = {}
         self.scheduler()
 
         self.gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=(memory / 2))
@@ -247,9 +250,8 @@ class PersonClassifier():
                     for i in range(len(emb_array)):
                         dist = np.sqrt(
                             np.sum(np.square(np.subtract(emb_array[i], self.person_embs.item().get(person)))))
-                        if dist < 1.1 and person != 'Unknown':
-                            poss = {'name': person, 'index': i, 'dist': dist}
-                            names.append(poss)
+                        poss = {'name': person, 'index': i, 'dist': dist}
+                        names.append(poss)
 
                 getIndex, getDist = lambda a: a['index'], lambda a: a['dist']  # or use operator.itemgetter
                 groups = itertools.groupby(sorted(names, key=getIndex), key=getIndex)
@@ -322,7 +324,7 @@ if __name__ == "__main__":
     parser.add_argument('model', type=str,
                         help='Path to a model protobuf (.pb) file')
     parser.add_argument('classifier',
-                        help='Path to the classifier (.pkl) files.')
+                        help='Path to the dir containing the classifier (.pkl) files.')
     parser.add_argument('data_dir', type=str,
                         help='Path to the data directory containing classifier data.')
     parser.add_argument('camera_topic', type=str,
